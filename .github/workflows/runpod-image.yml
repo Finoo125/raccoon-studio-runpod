@@ -1,0 +1,161 @@
+name: RunPod image
+
+# Manual only. The image is a release artifact: it is built from a published
+# release tag of THIS repo, never from an arbitrary push.
+#
+# This repo holds ONLY the recipe. The image's contents come from a published
+# release tag of Finoo125/raccoon-studio, checked out below - so an image can
+# only ever contain app code that shipped under a version number.
+#
+# Living here rather than in the app repo decouples the two: a Dockerfile fix is
+# a direct commit and a dispatch, instead of a release that would prompt every
+# desktop install to re-run its installer for a change that does not affect it.
+# GHCR also grants push rights from the package's linked repository, which is
+# this one, so nothing has to borrow a credential.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published version to build, without the v (e.g. 1.2.3)'
+        required: true
+        type: string
+      # The three below exist so pull-speed variants can be built and A/B'd
+      # against each other without editing this file. Defaults reproduce the
+      # shipping image exactly, so an ordinary release build passes none of them.
+      dockerfile:
+        description: 'Dockerfile to build, relative to this repo root'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      tag:
+        description: 'Image tag to push (blank = the version)'
+        required: false
+        type: string
+        default: ''
+      compression:
+        description: 'Layer compression'
+        required: false
+        type: choice
+        options: [gzip, zstd]
+        default: gzip
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/finoo125/raccoon-studio-runpod
+
+jobs:
+  build:
+    if: github.repository == 'Finoo125/raccoon-studio-runpod'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # The first attempt died here with "no space left on device", late enough
+      # that the runner could not even write its own diagnostic log — so the
+      # failure arrives with no numbers attached. Hence: delete what we can,
+      # then MOVE docker off / entirely, then print df at every stage so a
+      # repeat is diagnosable instead of another blind 40 minutes.
+      #
+      # An uncompressed ~17 GB image is not the peak. Peak is the overlay2
+      # snapshots plus the compressed blobs buildkit stages for the push, and
+      # that lands north of 35 GB — more than / has free even after the rm.
+      - name: Free up runner disk
+        run: |
+          echo '── before ──'; df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/lib/android /opt/hostedtoolcache \
+                      /usr/share/swift /usr/local/share/boost \
+                      /usr/share/miniconda /opt/az
+          echo '── after rm ──'; df -h
+
+          # Pick the roomiest mount by measurement rather than hardcoding /mnt:
+          # a runner image change cannot then silently put us back on a full
+          # disk. Moving the data root also discards the runner's preloaded
+          # images, which is a bonus — they were occupying / for nothing.
+          BIG=$(df --output=avail,target / /mnt 2>/dev/null | tail -n +2 | sort -rn | head -1 | awk '{print $2}')
+          echo "roomiest mount: $BIG"
+          if [ "$BIG" != "/" ]; then
+            sudo systemctl stop docker
+            sudo mkdir -p "$BIG/docker"
+            printf '{"data-root":"%s/docker"}\n' "$BIG" | sudo tee /etc/docker/daemon.json
+            sudo systemctl start docker
+          fi
+          docker info --format 'docker data root: {{.DockerRootDir}}'
+          echo '── final ──'; df -h
+
+      # The recipe comes from this repo, the CONTENT from the app repo at a
+      # release tag. Keeping them apart is the whole point: the recipe can change
+      # freely without a release, and only released content can enter a layer.
+      - name: Check out the build instructions
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      # No credential needed - raccoon-studio is public, and the job token reads
+      # it anonymously.
+      - name: Check out the app release being built
+        uses: actions/checkout@v4
+        with:
+          repository: Finoo125/raccoon-studio
+          ref: v${{ inputs.version }}
+          fetch-depth: 1
+          path: src
+
+      # Cheaper than a .dockerignore in the app repo, and it cannot drift: the
+      # context is a throwaway directory, so deleting from it is free.
+      - name: Drop .git from the build context
+        run: rm -rf src/.git
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: ci/${{ inputs.dockerfile }}
+          push: true
+          # A version tag, never :latest — a deployed pod has to be reproducible
+          # and a bad build must not roll out silently to everyone who deploys.
+          tags: ${{ env.IMAGE }}:${{ inputs.tag || inputs.version }}
+          # gzip decompression is single-threaded, which on a 10 GB layer is a
+          # real slice of a pod's boot. force-compression makes zstd apply to
+          # layers inherited from the base too, not just ours.
+          outputs: type=image,compression=${{ inputs.compression }},force-compression=true,oci-mediatypes=true
+          # source is where the image is BUILT from, which per the OCI spec means
+          # the recipe - this repo - and it matches the package's GHCR link so the
+          # two can never disagree. The app it packages is named separately below.
+          # Without an explicit version label the image inherits ubuntu's "24.04"
+          # and claims to be a release of Ubuntu.
+          labels: |
+            org.opencontainers.image.source=https://github.com/Finoo125/raccoon-studio-runpod
+            org.opencontainers.image.url=https://github.com/Finoo125/raccoon-studio
+            org.opencontainers.image.version=${{ inputs.version }}
+          # push:true streams layers straight to the registry instead of loading
+          # them into the local daemon, which halves peak disk on the runner.
+          # provenance:false keeps the result a plain image rather than an OCI
+          # index with an attestation manifest beside it.
+          provenance: false
+
+      # Runs even on failure: if this ever dies for space again, the numbers
+      # are here rather than in a log the runner was too full to write.
+      - name: Disk after build
+        if: always()
+        run: df -h
+
+      - name: Remind about package visibility
+        run: |
+          echo "Pushed ${{ env.IMAGE }}:${{ inputs.tag || inputs.version }} (${{ inputs.compression }}, ${{ inputs.dockerfile }})"
+          echo
+          echo "If this is the first push, the ghcr package starts PRIVATE."
+          echo "RunPod refuses registry credentials on a public template, so the"
+          echo "package must be made public before the template can pull it:"
+          echo "  https://github.com/users/Finoo125/packages/container/raccoon-studio-runpod/settings"
