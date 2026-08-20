@@ -1,9 +1,12 @@
 name: Package permission check
 
-# Throwaway diagnostic. Asks GHCR what this repo's GITHUB_TOKEN is allowed to do
-# with the package, WITHOUT pushing anything: the registry hands back a JWT whose
-# access claim lists the granted actions. Beats discovering "permission_denied:
-# write_package" at the end of an 11-minute build.
+# Throwaway diagnostic. Beats discovering "permission_denied: write_package" at
+# the end of an 11-minute build.
+#
+# GHCR hands out OPAQUE tokens, not JWTs, so there is no access claim to read -
+# the only honest test is to ask the registry to start a write. Initiating a blob
+# upload uploads no bytes and creates no package version, and we cancel it right
+# after, so a successful probe leaves nothing behind.
 on: workflow_dispatch
 
 permissions:
@@ -15,22 +18,30 @@ jobs:
     if: github.repository == 'Finoo125/raccoon-studio-runpod'
     runs-on: ubuntu-latest
     steps:
-      - name: Ask GHCR for a push-scoped token
+      - name: Can this repo's token write the package?
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          REPO=finoo125/raccoon-studio-runpod
           TOK=$(curl -sS -u "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:finoo125/raccoon-studio-runpod:pull,push" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:$REPO:pull,push" \
             | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))")
-          if [ -z "$TOK" ]; then echo "no token issued at all"; exit 1; fi
-          python3 - "$TOK" <<'PY'
-          import sys, json, base64
-          p = sys.argv[1].split('.')[1]
-          p += '=' * (-len(p) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(p))
-          access = claims.get('access', [])
-          print('access claim:', json.dumps(access))
-          actions = [a for e in access for a in e.get('actions', [])]
-          print('granted:', actions or '(none)')
-          print('CAN PUSH:', 'push' in actions)
-          sys.exit(0 if 'push' in actions else 1)
-          PY
+          [ -n "$TOK" ] || { echo "no token issued"; exit 1; }
+
+          OUT=$(curl -s -D - -o /dev/null -X POST \
+            -H "Authorization: Bearer $TOK" \
+            "https://ghcr.io/v2/$REPO/blobs/uploads/")
+          CODE=$(printf '%s' "$OUT" | head -1)
+          LOC=$(printf '%s' "$OUT" | grep -i '^location:' | tr -d '\r' | cut -d' ' -f2-)
+          echo "initiate upload -> $CODE"
+
+          case "$CODE" in
+            *202*)
+              echo "CAN PUSH: yes"
+              [ -n "$LOC" ] && curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOK" "$LOC" && echo "(upload cancelled)"
+              ;;
+            *)
+              echo "CAN PUSH: no"
+              printf '%s\n' "$OUT" | head -20
+              exit 1
+              ;;
+          esac
