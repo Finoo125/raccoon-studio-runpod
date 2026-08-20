@@ -1,18 +1,16 @@
 # syntax=docker/dockerfile:1
 # Raccoon Studio — RunPod pre-installed image, LAYER-SPLIT variant.
 #
-# Same install as runpod/Dockerfile, cut into two big layers instead of one.
+# Same install as Dockerfile, cut into two big layers instead of one.
 #
 # Why: a pod's boot from this template is 97% registry pull (measured
-# 2026-08-20 — 373 s of a 383 s boot; the app is up 10 s after the container
+# 2026-08-20 — 373 s of a 383 s boot; the app answers 10 s after the container
 # starts). All of that was ONE 10.57 GB layer, which cannot download in
 # parallel, whose extract cannot overlap its own download, and which no two
 # releases share a byte of.
 #
-# The cut is torch + its CUDA libraries, the single biggest thing in the image,
-# seeded into the venv the installer will use. The installer's step 7 then runs
-# the same `uv pip install torch torchvision torchaudio` against that venv, uv
-# audits it as satisfied, and the 2.5 GB download becomes a no-op.
+# The cut is torch and its CUDA libraries — the biggest thing in the image —
+# seeded into the venv the installer will later use.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -28,16 +26,17 @@ RUN apt-get update \
 COPY . /opt/raccoon
 WORKDIR /opt/raccoon
 
-# ── Layer 1 of the split: ComfyUI + venv + torch ─────────────────────────────
-# The clone has to happen here too, not just the venv. install-linux.sh step 6
-# does `git clone` into $COMFYUI_DIR, and git refuses a non-empty target — so a
-# venv seeded at $COMFYUI_DIR/.venv with no clone beside it would fail the
-# build. With main.py present the installer takes its "already exists" branch
-# and pins the revision, which is what we want anyway.
+# ── Layer 1 of the split: ComfyUI + venv + torch + CUDA libraries ────────────
+# The clone has to happen here too, not just the venv: install-linux.sh step 6
+# runs `git clone` into $COMFYUI_DIR and git refuses a non-empty target, so a
+# venv seeded at $COMFYUI_DIR/.venv with no clone beside it fails the build.
+# With main.py present the installer takes its "already exists" branch and pins
+# the revision, which is what we want anyway.
 #
-# Both the clone URL and the torch install line are duplicated from
-# install-linux.sh (steps 6 and 7). The guard in the next stage is what stops
-# that duplication from rotting silently.
+# The clone URL and the torch line are duplicated from install-linux.sh steps 6
+# and 7. The assertions in the next stage are what stop that from rotting.
+#
+# torchaudio is then removed again, deliberately — see the note below.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
  && git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git \
       /opt/raccoon/comfyui/ComfyUI \
@@ -45,24 +44,41 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
  && uv pip install --python /opt/raccoon/comfyui/ComfyUI/.venv/bin/python \
       torch torchvision torchaudio \
       --extra-index-url https://download.pytorch.org/whl/cu128 \
+ && uv pip uninstall --python /opt/raccoon/comfyui/ComfyUI/.venv/bin/python \
+      torchaudio \
  && rm -rf /root/.cache
 
+# Why torchaudio is uninstalled above, and why it is torchaudio:
+#
+# install-linux.sh up to and including v1.2.3 pipes its uv call through a grep
+# display filter and then decides success from the PIPELINE's status — which
+# under `pipefail` is grep's. A fully satisfied re-install prints "Audited N
+# packages", matches none of the filter's patterns, and the installer aborts
+# with "PyTorch installation failed" 0.06 s into step 7. Fixed upstream, but
+# this image builds from a release TAG, and the tags we can build still carry
+# the bug.
+#
+# Leaving one small package for step 7 to genuinely install gives the filter a
+# line to match. torchaudio is the smallest of the three, so the multi-GB CUDA
+# libraries and torch itself stay in the layer above and the split is unharmed.
+# Delete this once the version being built contains the installer fix.
+
 # ── Layer 2 of the split: everything else ────────────────────────────────────
-# Unchanged from runpod/Dockerfile. If the pre-seed above ever stops matching
-# what the installer wants, this still produces a correct image - it just
-# re-downloads torch and the split silently stops paying. Hence the assertion:
-# a second torch copy means the layers no longer divide the way this file
-# claims, and that should fail the build rather than ship a fat image.
+# NOTE the absence of a trailing `|| true` on this chain. An earlier revision
+# had one, meant to make only `du` non-fatal, and it swallowed the installer's
+# own failure: the build sailed past a dead install and fell over later at
+# `next build` with "next: not found", pointing at entirely the wrong step.
 RUN RS_FROM_ENGINE=1 bash install-linux.sh --gpu=nvidia --skip-controlnet \
  && rm -rf /root/.cache /root/.npm \
  && test -f /opt/raccoon/comfyui/ComfyUI/main.py \
- && echo '── layer sizes (what to cut next) ──' \
- && du -sh /opt/raccoon/comfyui/ComfyUI/.venv/lib/python3.12/site-packages/torch \
-           /opt/raccoon/comfyui/ComfyUI/.venv/lib/python3.12/site-packages/nvidia \
-           /opt/raccoon/comfyui/ComfyUI/.venv \
-           /opt/raccoon/comfyui/ComfyUI/custom_nodes \
-           /opt/raccoon/comfyui/ComfyUI/models \
-           /opt/raccoon/app/node_modules 2>/dev/null || true
+ && test -x /opt/raccoon/app/node_modules/.bin/next \
+ && echo '-- layer sizes (what to cut next) --' \
+ && { du -sh /opt/raccoon/comfyui/ComfyUI/.venv/lib/python3.12/site-packages/torch \
+              /opt/raccoon/comfyui/ComfyUI/.venv/lib/python3.12/site-packages/nvidia \
+              /opt/raccoon/comfyui/ComfyUI/.venv \
+              /opt/raccoon/comfyui/ComfyUI/custom_nodes \
+              /opt/raccoon/comfyui/ComfyUI/models \
+              /opt/raccoon/app/node_modules 2>/dev/null; true; }
 
 RUN cd app && RACCOON_KIOSK=1 npm run build
 
